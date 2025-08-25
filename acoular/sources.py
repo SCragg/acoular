@@ -86,7 +86,6 @@ def _fill_mic_signal_block(out, signal, rm, ind, blocksize, num_channels, up, pr
             for m in range(num_channels):
                 out[b, m] = signal[int(0.5 + ind[0, m])] / rm[0, m]
             ind += up
-    return out
 
 
 def spherical_hn1(n, z):
@@ -881,7 +880,8 @@ class PointSource(SamplesGenerator):
             If signal processing or propagation cannot be performed.
         """
         self._validate_locations()
-        N = int(np.ceil(self.num_samples / num))  # number of output blocks
+        num_samples_estimate = self.num_samples + (self.start_t - self.start) * self.sample_freq
+        N = int(np.ceil(num_samples_estimate / num))  # number of output blocks
         signal = self.signal.usignal(self.up)
         out = np.empty((num, self.num_channels))
         # distances
@@ -896,16 +896,16 @@ class PointSource(SamplesGenerator):
             # if signal stops during prepadding, terminate
             if pre >= N:
                 for _nb in range(N - 1):
-                    out = _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
+                    _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
                     yield out
 
                 blocksize = self.num_samples % num or num
-                out = _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, True)
+                _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, True)
                 yield out[:blocksize]
                 return
             else:
                 for _nb in range(pre):
-                    out = _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
+                    _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, True)
                     yield out
 
         else:
@@ -913,12 +913,12 @@ class PointSource(SamplesGenerator):
 
         # main generator
         for _nb in range(N - pre - 1):
-            out = _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, False)
+            _fill_mic_signal_block(out, signal, rm, ind, num, self.num_channels, self.up, False)
             yield out
 
         # last block of variable size
         blocksize = self.num_samples % num or num
-        out = _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, False)
+        _fill_mic_signal_block(out, signal, rm, ind, blocksize, self.num_channels, self.up, False)
         yield out[:blocksize]
 
 
@@ -1228,6 +1228,264 @@ class MovingPointSource(PointSource):
                     yield out[:n]
                 break
             n -= num
+
+
+class PointSourceDirectional(PointSource):
+    """
+    Define a fixed point source with directivity.
+
+    The :class:`PointSourceDirectional` class simulates a fixed point source with directivity.
+
+    The generated output is available via the :meth:`result` generator.
+
+    See Also
+    --------
+    :class:`acoular.sources.PointSource` : For modeling stationary point sources.
+
+    Notes
+    -----
+    - Directivity of the sources to be simulated later on, currently this class just
+      calculates directions between sources and recievers.
+    - Currently direction of the microphones are hardcoded.
+    """
+
+    #: Vectors defining the local orientation of the source relative to global space
+    #: These vectors must be orthogonal to each other
+    forward_vec = Tuple((0.0, 0.0, 1.0), desc='source forward direction')
+    up_vec = Tuple((0.0, 1.0, 0.0), desc='source upward direction')
+    right_vec = Tuple((1.0, 0.0, 0.0), desc='source right direction')
+
+    #: Behavior of the signal for negative time indices. Currently only supports `loop`. Default is
+    #: ``'loop'``.
+    prepadding = Enum('loop', desc='Behaviour for negative time indices.')
+
+    #: A unique identifier for the current state of the source, based on its properties. (read-only)
+    digest = Property(
+        depends_on=[
+            'mics.digest',
+            'signal.digest',
+            'loc',
+            'env.digest',
+            'start_t',
+            'start',
+            'up',
+            'forward_vec',
+            'up_vec',
+            'right_vec',
+            'prepadding',
+        ],
+    )
+
+    @cached_property
+    def _get_digest(self):
+        return digest(self)
+
+    def result(self, num=128):
+        """
+        Generate output signal at microphones in blocks.
+
+        Parameters
+        ----------
+        num : :class:`int`, optional
+            Number of samples per block to yield. Default is ``128``.
+
+        Yields
+        ------
+        :class:`numpy.ndarray`
+            A 2D array of shape (``num``, :attr:`~PointSource.num_channels`) containing the signal
+            detected at the microphones. The last block may have fewer samples if
+            :attr:`~PointSource.num_samples` is not a multiple of ``num``.
+
+        Raises
+        ------
+        :obj:`IndexError`
+            If no more samples are available from the source.
+
+        Notes
+        -----
+        If samples are needed for times earlier than the source's :attr:`~PointSource.start_t`, the
+        signal is taken from the end of the signal array, effectively looping the signal for
+        negative indices.
+        """
+
+        # calculate directions between source and recievers
+        mpos = self.mics.pos
+
+        # normalise local direction vectors
+        forward_n = np.array(self.forward_vec, dtype=float)
+        forward_n /= np.linalg.norm(forward_n)
+
+        up_n = np.array(self.up_vec, dtype=float)
+        up_n /= np.linalg.norm(up_n)
+
+        right_n = np.array(self.right_vec, dtype=float)
+        right_n /= np.linalg.norm(right_n)
+
+        # check orthagonality
+        assert(np.dot(up_n, forward_n) < 1e-12)
+        assert(np.dot(up_n, right_n) < 1e-12)
+        assert(np.allclose(np.cross(up_n, forward_n), right_n))
+
+        # calculate directions in global space
+        gdirs_to_source = []
+
+        for i in range(0, self.mics.num_mics):
+            # get mic positiion
+            x = mpos[0][i]
+            y = mpos[1][i]
+            z = mpos[2][i]
+
+            mic_point = np.array([x, y, z])
+
+            # This is the direction of the source in relation to the mics
+            gdirs_to_source.append(np.array(self.loc, dtype=float) - mic_point)
+
+        # create transformation matrix for the local coordinate space of the source
+        source_trans_mat = np.vstack([right_n, up_n, forward_n]).T
+
+        # directions of microphones relative to sources ref and up vector
+        rdirs_to_mic = []
+
+        for i in range(0, self.mics.num_mics):
+            gdir_to_mic = gdirs_to_source[i] * (-1)
+            rdirs_to_mic.append(source_trans_mat @ gdir_to_mic)
+
+        # direction of sources in relative to microphones
+        rdirs_to_source = []
+        for i in range(0, self.mics.num_mics):
+            # @TODO set these values somewhere - later microphone in its own class?
+            mic_up = np.array((0, 1, 0), dtype=float)
+            mic_forward = np.array((0, 0, 1), dtype=float)
+            mic_right = np.array((1, 0, 0), dtype=float)
+
+            assert(np.dot(mic_up, mic_forward) < 1e-12)
+            assert(np.dot(mic_up, mic_right) < 1e-12)
+
+            mic_trans_mat = np.vstack([mic_right, mic_up, mic_forward]).T
+            rdirs_to_source.append(mic_trans_mat @ gdirs_to_source[i])
+
+        # @TODO do something with the directions, store these as an attribute?
+        for i, dir_to_source in enumerate(rdirs_to_source):
+            print(f'mic{i} direction to source: {dir_to_source}')
+
+        for i, dir_to_mic in enumerate(rdirs_to_mic):
+            print(f'mic{i} direction to source: {dir_to_mic}')
+
+        # a simple function to add some sort of directivity to the source
+        def directivity_coeff(source_forward_dir, mic_dir):
+            # based on Lambertian reflectance
+            dir_n = source_forward_dir / np.linalg.norm(source_forward_dir)
+            mic_n = mic_dir / np.linalg.norm(mic_dir)
+
+            return (np.dot(dir_n, mic_n) + 1) / 2
+        
+        # mic coeffs
+        directivity_atten = []
+        for i in range(0, self.mics.num_mics):
+
+            directivity_atten.append(directivity_coeff(forward_n, gdirs_to_source[i] * (-1)))
+
+        print(rdirs_to_mic)
+        print(directivity_atten)
+
+        def fill_block_with_directivity(out, signal, rm, ind, blocksize, num_channels, up, prepadding, dir_fn, src_fwd, dirs_to_source, sr, source):
+            # As this function is run for each block, we must rotate forward direction every sample by a given rotation
+            # rotation matrix around y axis is as follows:
+            #
+            #   cos(theta)  0       sin(theta)
+            #   0           1       0
+            #   -sin(theta) 0       cos(theta)
+
+            rot_angle = np.deg2rad(180/sr)
+            rot_mat = np.array([[np.cos(rot_angle), 0, np.sin(rot_angle)],
+                                 [0, 1, 0],
+                                 [-np.sin(rot_angle), 0, np.cos(rot_angle)]])
+            
+            # only need to rotate forward vec as using direction in global space
+            rotated_forward_vec = src_fwd
+            # update source object for future blocks
+            nonlocal forward_n
+            nonlocal up_n
+            nonlocal right_n
+
+            forward_n = rot_mat @ forward_n
+            up_n = rot_mat @ up_n
+            right_n = rot_mat @ right_n
+
+            # # recalculate normals
+            # forward_n = np.array(self.forward_vec, dtype=float)
+            # forward_n /= np.linalg.norm(forward_n)
+
+            # up_n = np.array(self.up_vec, dtype=float)
+            # up_n /= np.linalg.norm(up_n)
+
+            # right_n = np.array(self.right_vec, dtype=float)
+            # right_n /= np.linalg.norm(right_n)
+
+            if prepadding:
+                for b in range(blocksize):
+                    rotated_forward_vec = rot_mat @ rotated_forward_vec
+                    #print(rotated_forward_vec)
+                    for m in range(num_channels):
+                        coeff = dir_fn(rotated_forward_vec, dirs_to_source[m] * -1)
+                        #print(f'coeff: {coeff}')
+                        if ind[0, m] < 0:
+                            out[b, m] = 0
+                        else:
+                            out[b, m] = (signal[int(0.5 + ind[0, m])] * coeff) / rm[0, m]
+                    ind += up
+            else:
+                for b in range(blocksize):
+                    rotated_forward_vec = rot_mat @ rotated_forward_vec
+                    #print(rotated_forward_vec)
+                    for m in range(num_channels):
+                        coeff = dir_fn(rotated_forward_vec, dirs_to_source[m] * -1)
+                        #print(f'coeff: {coeff}')
+                        out[b, m] = (signal[int(0.5 + ind[0, m])] * coeff) / rm[0, m]
+                    ind += up
+
+        # generate output
+        self._validate_locations()
+        num_samples_estimate = self.num_samples + (self.start_t - self.start) * self.sample_freq
+        N = int(np.ceil(num_samples_estimate / num))  # number of output blocks
+        signal = self.signal.usignal(self.up)
+        out = np.empty((num, self.num_channels))
+        # distances
+        rm = self.env._r(np.array(self.loc).reshape((3, 1)), self.mics.pos).reshape(1, -1)
+        # emission time relative to start_t (in samples) for first sample
+        ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq * self.up
+
+        if self.prepadding == 'zeros':
+            # number of blocks where signal behaviour is amended
+            pre = -int(np.min(ind[0]) // (self.up * num))
+            # amend signal for first blocks
+            # if signal stops during prepadding, terminate
+            if pre >= N:
+                for _nb in range(N - 1):
+                    fill_block_with_directivity(out, signal, rm, ind, num, self.num_channels, self.up, True, directivity_coeff, forward_n, gdirs_to_source, self.sample_freq, self)
+                    yield out
+
+                blocksize = self.num_samples % num or num
+                fill_block_with_directivity(out, signal, rm, ind, blocksize, self.num_channels, self.up, True, directivity_coeff, forward_n, gdirs_to_source, self.sample_freq, self)
+                yield out[:blocksize]
+                return
+            else:
+                for _nb in range(pre):
+                    fill_block_with_directivity(out, signal, rm, ind, num, self.num_channels, self.up, True, directivity_coeff, forward_n, gdirs_to_source, self.sample_freq, self)
+                    yield out
+
+        else:
+            pre = 0
+
+        # main generator
+        for _nb in range(N - pre - 1):
+            fill_block_with_directivity(out, signal, rm, ind, num, self.num_channels, self.up, False, directivity_coeff, forward_n, gdirs_to_source, self.sample_freq, self)
+            yield out
+
+        # last block of variable size
+        blocksize = self.num_samples % num or num
+        fill_block_with_directivity(out, signal, rm, ind, blocksize, self.num_channels, self.up, False, directivity_coeff, forward_n, gdirs_to_source, self.sample_freq, self)
+        yield out[:blocksize]
 
 
 class PointSourceDipole(PointSource):
