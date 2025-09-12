@@ -129,8 +129,7 @@ class PointSourceDirectional(PointSource):
     - Currently direction of the microphones are hardcoded.
     """
 
-    # Type of DirecetivityCalculator used to calculate directivity which will be instantiated later
-    dir_calc = Instance(Directivity)
+    directivity = Instance(Directivity)
 
     def result(self, num=128):
         """
@@ -159,11 +158,10 @@ class PointSourceDirectional(PointSource):
         signal is taken from the end of the signal array, effectively looping the signal for
         negative indices.
         """
-        self.dir_calc._validate_orientation()
         self._validate_locations()
 
         # object directions do not change once set
-        self.dir_calc.target_directions = self.mics.pos - np.array(self.loc).reshape(3, 1)
+        self.directivity.target_directions = self.mics.pos - np.array(self.loc).reshape(3, 1)
 
         # -----------------------------------------------------------------------------------------
         # For now lets do speherical harmonic stuff in here and we will move it
@@ -190,7 +188,6 @@ class PointSourceDirectional(PointSource):
 
             azimuths, elevations = get_angle_to_target(mic_pos, self.mics.orientations, src_pos)
 
-            print(azimuths, elevations)
 
         # generate output
         signal = self.signal.usignal(self.up)
@@ -199,18 +196,16 @@ class PointSourceDirectional(PointSource):
         rm = self.env._r(np.array(self.loc).reshape((3, 1)), self.mics.pos).reshape(1, -1)
         ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq
 
+        # incorporate directivity
+        rm /= self.directivity.coefficients
+
         i = 0
         n = self.num_samples
 
         while n:
             n -= 1
             try:
-                print(self._calc_rotation_matrix(ind[0,:]).shape)
-                self.dir_calc.orientation = (self._calc_rotation_matrix(ind[0,:]) @ self.dir_calc.orientation).T
-                coeffs = self.dir_calc()
-                #coeffs = np.ones(self.mics.num_mics)
-
-                out[i] = (signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * coeffs) / rm
+                out[i] = signal[np.array(0.5 + ind * self.up, dtype=np.int64)] / rm
                 ind += 1.0
                 i += 1
                 if i == num:
