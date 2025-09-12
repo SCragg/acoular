@@ -19,7 +19,7 @@ from .base import (
     TimeOut,
 )
 from .calib import Calib
-from .directivity import (num_channels_for_sph_degree, MicGeomDirectional, OmniDirectivity, CardioidDirectivity, PointSourceDirectional)
+from .directivity import (num_channels_for_sph_degree, MicGeomDirectional, OmniDirectivity, CardioidDirectivity, SphericalHarmonicDirectivity, PointSourceDirectional)
 from .environments import (
     Environment,
     FlowField,
