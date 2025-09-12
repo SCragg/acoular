@@ -9,7 +9,8 @@ Implements methods required for directivity shared by source
 from abc import abstractmethod
 import numpy as np
 import scipy.linalg as spla
-from traits.api import CArray, Enum, Float, ABCHasStrictTraits, Instance, List, Property, Str, cached_property
+from scipy.special import sph_harm_y_all
+from traits.api import CArray, Enum, Float, Int, ABCHasStrictTraits, Instance, List, Property, Str, cached_property
 
 # acoular imports
 from .internal import digest
@@ -62,6 +63,24 @@ def get_angle_to_target(src_locs, src_orientations, target_locs):
     return azimuth, elevation
 
 
+def num_channels_for_sph_degree(n):
+    return (n+1)**2
+
+
+# @TODO - Try to speed this up without iterating over the arrays.
+# Also potentially different orderings of ambisonic channels might need to change this?
+def squash_sph_harm_array(harm_array):
+    result = np.empty(num_channels_for_sph_degree(harm_array.shape[0]-1))
+
+    i = 0
+    for degree, _ in enumerate(harm_array):
+        for order in range(-degree, degree+1):
+            result[i] = harm_array[degree, order]
+            i+=1
+
+    return result
+
+
 class Directivity(ABCHasStrictTraits):
     """
     Abstract base class for directivity calculation.
@@ -94,6 +113,16 @@ class CardioidDirectivity(Directivity):
     def _get_coefficients(self):
         obj_dir_norm = self.object_directions / np.linalg.norm(self.object_directions, axis=0, keepdims=True)
         return (self.orientation[2].reshape(3, 1).T @ obj_dir_norm + 1) / 2
+
+
+# class SphericalHarmonicDirectivity(Directivity):
+#     """
+#     Define directivity for all orders of spherical harmonics given a degree.
+#     """
+#     n = Int(1)
+    
+#     @cached_property
+#     # def _get_coefficients(self):
 
 
 class PointSourceDirectional(PointSource):
@@ -167,20 +196,37 @@ class PointSourceDirectional(PointSource):
         # -----------------------------------------------------------------------------------------
 
         if isinstance(self.mics, MicGeomDirectional):
-            # @TODO change from lists and speed up by vectorising and to not iterate over each mic
-            azimuths = np.empty(shape=self.mics.num_mics)
-            elevations = np.empty(shape=self.mics.num_mics)
-
             mic_pos = self.mics.pos.T
             src_pos = np.array(self.loc).reshape(1, 3)
 
             azimuths, elevations = get_angle_to_target(mic_pos, self.mics.orientations, src_pos)
+            print(f'theta (elevations):{elevations}, phi (azimuths):{azimuths}')
 
-            print(azimuths, elevations)
+            # For speherical harmonics check if any of the MicGeom Directivities are SpehericalHarmonics:
+            # If it is we will add more channels to the output based on the order and degree
+
+            # @ TODO when Directivity class is used for MicGeomDirectional - for now just an assumption
+            # if sph_harm in directivities:
+            if self.mics.num_mics > 1:
+                raise RuntimeError("When using SphericalHarmonicsDirectivity - only a single mic in a geom is currently supported")
+            
+            # @TODO this will be stored in Directivity class
+            sph_order = 2
+
+            additional_channels = num_channels_for_sph_degree(sph_order) - 1
+            print(f'additional_channels: {additional_channels}')
+
+            # @TODO - Check how are these coeffs scaled? Is m = n = 0 always the same value or does it depends on the other coeffs?
+            assert(len(elevations) == len(azimuths) and len(azimuths) == 1)
+            sph_harms = sph_harm_y_all(sph_order, sph_order, elevations[0], azimuths[0])
+            
+            # @TODO Check - can complex part be discarded??
+            mic_coeffs = squash_sph_harm_array(sph_harms)
+
 
         # generate output
         signal = self.signal.usignal(self.up)
-        out = np.empty((num, self.num_channels))
+        out = np.empty((num, self.num_channels + additional_channels))
         # distances
         rm = self.env._r(np.array(self.loc).reshape((3, 1)), self.mics.pos).reshape(1, -1)
         ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq
@@ -191,17 +237,17 @@ class PointSourceDirectional(PointSource):
         while n:
             n -= 1
             try:
-                print(self._calc_rotation_matrix(ind[0,:]).shape)
-                self.dir_calc.orientation = (self._calc_rotation_matrix(ind[0,:]) @ self.dir_calc.orientation).T
-                coeffs = self.dir_calc()
-                #coeffs = np.ones(self.mics.num_mics)
+                # print(self._calc_rotation_matrix(ind[0,:]).shape)
+                # self.dir_calc.orientation = (self._calc_rotation_matrix(ind[0,:]) @ self.dir_calc.orientation).T
+                # coeffs = self.dir_calc()
+                coeffs = np.ones(self.mics.num_mics)
 
-                out[i] = (signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * coeffs) / rm
+                out[i] = ((signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * coeffs) / rm) * mic_coeffs
                 ind += 1.0
                 i += 1
                 if i == num:
                     yield out
-                    out = np.zeros((num, self.num_channels))
+                    out = np.zeros((num, self.num_channels + additional_channels))
                     i = 0
             except IndexError:
                 break
