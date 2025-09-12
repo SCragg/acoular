@@ -62,6 +62,19 @@ def get_angle_to_target(src_locs, src_orientations, target_locs):
 
     return azimuth, elevation
 
+def cart2sph(coordinates):
+    x = coordinates[:,0]
+    y = coordinates[:,1]
+    z = coordinates[:,2]
+
+    hypot_xz = np.hypot(x, z)
+
+    azimuth = np.arctan2(x, z)
+    elevation = np.arctan2(y, hypot_xz)
+    r = np.hypot(hypot_xz, y)
+
+    return azimuth, elevation, r
+
 
 def num_channels_for_sph_degree(n):
     return (n+1)**2
@@ -70,6 +83,7 @@ def num_channels_for_sph_degree(n):
 # @TODO - Try to speed this up without iterating over the arrays.
 # Also potentially different orderings of ambisonic channels might need to change this?
 def squash_sph_harm_array(harm_array):
+    print(harm_array.shape)
     result = np.empty(num_channels_for_sph_degree(harm_array.shape[0]-1))
 
     i = 0
@@ -115,14 +129,21 @@ class CardioidDirectivity(Directivity):
         return (self.orientation[2].reshape(3) @ obj_dir_norm + 1) / 2
 
 
-# class SphericalHarmonicDirectivity(Directivity):
-#     """
-#     Define directivity for all orders of spherical harmonics given a degree.
-#     """
-#     n = Int(1)
+class SphericalHarmonicDirectivity(Directivity):
+    """
+    Define directivity for all orders of spherical harmonics given a degree.
+    """
+    n = Int(1)
     
-#     @cached_property
-#     # def _get_coefficients(self):
+    @cached_property
+    def _get_coefficients(self):
+        target_directions_local = np.matvec(self.orientation.reshape(-1, 3, 3), self.target_directions.reshape(-1, 3))
+        azimuth, elevation, _ = cart2sph(target_directions_local)
+
+        # @TODO - Check how are these coeffs scaled? Is m = n = 0 always the same value or does it depends on the other coeffs?
+        #       - can imaginary part be discarded?
+        sph_harms = sph_harm_y_all(self.n, self.n, elevation[0], azimuth[0])
+        return squash_sph_harm_array(sph_harms)
 
 
 class PointSourceDirectional(PointSource):
@@ -180,6 +201,9 @@ class PointSourceDirectional(PointSource):
         # object directions do not change once set
         self.dir_calc.target_directions = self.mics.pos - np.array(self.loc).reshape(3, 1)
 
+        # additional output channels may be added if we are using sph_harm recievers
+        additional_channels = 0
+
         # -----------------------------------------------------------------------------------------
         # For now lets do speherical harmonic stuff in here and we will move it
         # later to somewhere more sensible.
@@ -196,33 +220,29 @@ class PointSourceDirectional(PointSource):
         # -----------------------------------------------------------------------------------------
 
         if isinstance(self.mics, MicGeomDirectional):
-            mic_pos = self.mics.pos.T
-            src_pos = np.array(self.loc).reshape(1, 3)
+            mic_pos = self.mics.pos
+            src_pos = np.array(self.loc)
 
-            azimuths, elevations = get_angle_to_target(mic_pos, self.mics.orientations, src_pos)
-            print(f'theta (elevations):{elevations}, phi (azimuths):{azimuths}')
+            # if sph_harm is the only directivity all coeffs are generated from that object:
+            if self.mics.num_mics == 1 and isinstance(self.mics.directivities[0], SphericalHarmonicDirectivity):
 
-            # For speherical harmonics check if any of the MicGeom Directivities are SpehericalHarmonics:
-            # If it is we will add more channels to the output based on the order and degree
-
-            # @ TODO when Directivity class is used for MicGeomDirectional - for now just an assumption
-            # if sph_harm in directivities:
-            if self.mics.num_mics > 1:
-                raise RuntimeError("When using SphericalHarmonicsDirectivity - only a single mic in a geom is currently supported")
-            
-            # @TODO this will be stored in Directivity class
-            sph_order = 2
-
-            additional_channels = num_channels_for_sph_degree(sph_order) - 1
-            print(f'additional_channels: {additional_channels}')
-
-            # @TODO - Check how are these coeffs scaled? Is m = n = 0 always the same value or does it depends on the other coeffs?
-            assert(len(elevations) == len(azimuths) and len(azimuths) == 1)
-            sph_harms = sph_harm_y_all(sph_order, sph_order, elevations[0], azimuths[0])
-            
-            # @TODO Check - can complex part be discarded??
-            mic_coeffs = squash_sph_harm_array(sph_harms)
-
+                sph_harm_calc = self.mics.directivities[0]
+                sph_harm_calc.target_directions = (src_pos - mic_pos[0]).reshape(3, 1)
+                # create additional channels based on the spherical harmonics order
+                additional_channels = num_channels_for_sph_degree(sph_harm_calc.n) - 1
+                mic_coeffs = sph_harm_calc.coefficients
+            # otherwise each directivity is used for each individual mic coeff
+            else:
+                mic_coeffs = np.ones(self.num_mics)
+                # @Note - Is there a way to speed this up to prevent iterating over individual Directivities
+                for m, directivity in enumerate(self.mics.directivities):
+                    if isinstance(directivity, SphericalHarmonicDirectivity):
+                        raise RuntimeError(f'SphericalHarmonicDirectivity can currently only be used if it is the only mic in the Geom')
+                    else:
+                        directivity.target_directions = (src_pos - mic_pos[m]).reshape(3, 1)
+                        coeff = directivity.coefficients
+                        assert(len(coeff) == 1)
+                        mic_coeffs[m] = coeff
 
         # generate output
         signal = self.signal.usignal(self.up)
@@ -283,28 +303,14 @@ class MicGeomDirectional(MicGeom):
     """
 
     # @TODO none of the XML parsing mechanics has been implemented
-    # @TODO decide how to store/represent each directivity
 
-    # @TODO don't store these as strings
     #: Array containing directivity for each microphone, including invalid ones
-    directivities_total = List(Enum('omni', 'cardioid'), desc='directivity for each microphone')
+    directivities_total = List(Instance(Directivity, ()), desc='directivity for each microphone')
 
-    # @TODO don't store these as strings
-    #: Array containing directivity for each microphone, excluding those in invalid_channels (read-only)
-    directivities = Property(depends_on=['pos_total', 'invalid_channels'], desc='directivity for each microphone')
+    directivities = Property(depends_on=['directivities_total', 'invalid_channels'], desc='directivity for each microphone')
 
     def _get_directivities(self):
         return [self.directivities_total[i] for i in self._valid_channels]
-
-    #: Vectors defining the local orientation of the microphones relative to global space
-    #: These vectors must be orthogonal to each other
-    #: self.orientation[0] = right_vec
-    #: self.orientation[1] = up_vec
-    #: self.orientation[2] = forward_vec
-    orientations_total = CArray(dtype=float, shape=(None,3,3), desc='orientations for each microphone')
-
-    orientations = Property(depends_on=['orientations_total', 'invalid_channels'],
-                            desc='orientation for each microphone')
 
     def _get_orientations(self):
         return self.orientations_total[self._valid_channels]
