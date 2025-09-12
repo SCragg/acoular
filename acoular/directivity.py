@@ -110,7 +110,7 @@ class Directivity(ABCHasStrictTraits):
         if not np.allclose(np.dot(self.orientation, self.orientation.T), np.eye(3), atol=1e-12):
             raise ValueError('Orientation matrix must be orthogonal.')
 
-    #: Vector defining the direction of the object we are working out direction to. Default is (0, 0, 1)
+    # TODO: QUESTION: Is it good to have target_directions and orientation as attributes? Shouldn't they be arguments to get_coefficients or similar?
     target_directions = Property(desc='Directions of the other objects to which the directivity is to be calculated.')
 
     _target_directions = CArray(shape=(3, None), default=np.array([[0.0], [0.0], [1.0]]))
@@ -317,6 +317,56 @@ class RotatingPointSource(PointSourceDirectional):
             rot_mats = rot_mats.transpose(2, 0, 1)
 
         return rot_mats
+
+    def result(self, num=128):
+        self._validate_locations()
+
+        # object directions do not change once set
+        self.directivity.target_directions = self.mics.pos - np.array(self.loc).reshape(3, 1)
+
+        if isinstance(self.mics, MicGeomDirectional):
+            # @TODO change from lists and speed up by vectorising and to not iterate over each mic
+            azimuths = np.empty(shape=self.mics.num_mics)
+            elevations = np.empty(shape=self.mics.num_mics)
+
+            mic_pos = self.mics.pos.T
+            src_pos = np.array(self.loc).reshape(1, 3)
+
+            azimuths, elevations = get_angle_to_target(mic_pos, self.mics.orientations, src_pos)
+
+
+        # generate output
+        signal = self.signal.usignal(self.up)
+        out = np.empty((num, self.num_channels))
+        # distances
+        rm = self.env._r(np.array(self.loc).reshape((3, 1)), self.mics.pos).reshape(1, -1)
+        ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq
+
+        i = 0
+        n = self.num_samples
+
+        # for constant rotation, the rotation matrix in each step stays the same
+        rad = self.rot_speed / self.sample_freq
+        sin_a, cos_a = np.sin(rad), np.cos(rad)
+        rotation_matrix = np.array([[cos_a, 0.0, sin_a],
+                                    [0.0, 1.0, 0.0],
+                                    [-sin_a, 0.0, cos_a]])
+
+        while n:
+            n -= 1
+            try:
+                self.directivity.orientation = rotation_matrix @ self.directivity.orientation
+                out[i] = signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * self.directivity.coefficients / rm
+                ind += 1.0
+                i += 1
+                if i == num:
+                    yield out
+                    out = np.zeros((num, self.num_channels))
+                    i = 0
+            except IndexError:
+                break
+        yield out[:i]
+
 
 class MicGeomDirectional(MicGeom):
     """
