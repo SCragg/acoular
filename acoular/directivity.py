@@ -58,7 +58,7 @@ def get_angle_to_target(src_locs, src_orientations, target_locs):
     # @TODO check this logic - 3x3 orientation matrix should be the transformation matrix if each dimension is normalised?
     directions = np.matvec(src_orientations, directions)
     azimuth = np.arctan2(directions[:,0], directions[:,2])
-    elevation = np.arctan2(directions[:,1], np.hypot(directions[:,0], directions[:,2]))
+    elevation = np.mod(np.arctan2(directions[:,1], np.hypot(directions[:,0], directions[:,2])), 2 * np.pi)
 
     return azimuth, elevation
 
@@ -69,27 +69,38 @@ def cart2sph(coordinates):
 
     hypot_xz = np.hypot(x, z)
 
-    azimuth = np.arctan2(x, z)
-    elevation = np.arctan2(y, hypot_xz)
+    azimuth = np.mod(np.arctan2(x, z), 2 * np.pi)
     r = np.hypot(hypot_xz, y)
+    elevation = np.arccos(y / r)
 
     return azimuth, elevation, r
-
 
 def num_channels_for_sph_degree(n):
     return (n+1)**2
 
-
-# @TODO - Try to speed this up without iterating over the arrays.
-# Also potentially different orderings of ambisonic channels might need to change this?
 def squash_sph_harm_array(harm_array):
-    print(harm_array.shape)
-    result = np.empty(num_channels_for_sph_degree(harm_array.shape[0]-1))
+    original_shape = harm_array.shape
+    n_max = original_shape[0] - 1
+    num_coeffs = num_channels_for_sph_degree(n_max)
 
+    # Preserve trailing dimensions if present
+    trailing_shape = original_shape[2:] if len(original_shape) > 2 else ()
+    result_shape = (num_coeffs,) + trailing_shape
+    result = np.empty(result_shape)
+
+    # Transforming the complex spherical harmonics to real spherical harmonics
     i = 0
-    for degree, _ in enumerate(harm_array):
-        for order in range(-degree, degree+1):
-            result[i] = harm_array[degree, order]
+    for n in range(n_max + 1):
+        for m in range(-n, n+1):
+            complex_harmonics = harm_array[n, m]
+            if m == 0:
+                result[i] = np.real(complex_harmonics)
+            elif m > 0:
+                result[i] = np.real(complex_harmonics) * np.sqrt(2)
+            elif m < 0:
+                result[i] = np.imag(complex_harmonics) * np.sqrt(2) * float(-1)**(m+1)
+            
+            result[i] *= float(-1)**(m)
             i+=1
 
     return result
@@ -143,17 +154,6 @@ class CardioidDirectivity(Directivity):
         return 0.5 * (1.0 + np.dot(self.orientation[2], self.target_directions))
 
 
-
-# class SphericalHarmonicDirectivity(Directivity):
-#     """
-#     Define directivity for all orders of spherical harmonics given a degree.
-#     """
-#     n = Int(1)
-    
-#     @cached_property
-#     # def _get_coefficients(self):
-
-
 class SphericalHarmonicDirectivity(Directivity):
     """
     Define directivity for all orders of spherical harmonics given a degree.
@@ -162,13 +162,11 @@ class SphericalHarmonicDirectivity(Directivity):
     
     @cached_property
     def _get_coefficients(self):
-        target_directions_local = np.matvec(self.orientation.reshape(-1, 3, 3), self.target_directions.reshape(-1, 3))
+        target_directions_local = np.matvec(self.orientation.reshape(-1, 3, 3), self.target_directions.T.reshape(-1, 3))
         azimuth, elevation, _ = cart2sph(target_directions_local)
-
-        # @TODO - Check how are these coeffs scaled? Is m = n = 0 always the same value or does it depends on the other coeffs?
-        #       - can imaginary part be discarded?
-        sph_harms = sph_harm_y_all(self.n, self.n, elevation[0], azimuth[0])
-        return squash_sph_harm_array(sph_harms)
+        sph_harms = sph_harm_y_all(self.n, self.n, elevation, azimuth)
+        sph_harms = squash_sph_harm_array(sph_harms)
+        return sph_harms
 
 
 class PointSourceDirectional(PointSource):
@@ -253,7 +251,7 @@ class PointSourceDirectional(PointSource):
                 sph_harm_calc.target_directions = (src_pos - mic_pos[0]).reshape(3, 1)
                 # create additional channels based on the spherical harmonics order
                 additional_channels = num_channels_for_sph_degree(sph_harm_calc.n) - 1
-                mic_coeffs = sph_harm_calc.coefficients
+                mic_coeffs = sph_harm_calc.coefficients.squeeze()
             # otherwise each directivity is used for each individual mic coeff
             else:
                 mic_coeffs = np.ones(self.num_mics)
@@ -283,7 +281,7 @@ class PointSourceDirectional(PointSource):
         while n:
             n -= 1
             try:
-                out[i] = signal[np.array(0.5 + ind * self.up, dtype=np.int64)] / rm
+                out[i] = (signal[np.array(0.5 + ind * self.up, dtype=np.int64)] / rm) * mic_coeffs
                 ind += 1.0
                 i += 1
                 if i == num:
