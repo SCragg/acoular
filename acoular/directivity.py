@@ -18,50 +18,6 @@ from .microphones import MicGeom
 from .sources import PointSource
 
 
-def get_angle_to_target(src_locs, src_orientations, target_locs):
-    """
-    This function computes the azimuths and elevations of target points to the source points
-    relative to the sources orientation.
-
-    Parameters
-    ----------
-    src_locs : :class:`np.array`
-        These are the (x, y, z) coordinates of the sources - this array must be supplied as shape
-        (N, 3) where N is the number of sources.
-
-    src_orientation : :class:`np.array`
-        These are the right, up and forward vectors of the sources - these vectors must be orthogonal
-        and normalised. The layout of the matrix is shown below. The shape of the array must be (N,3,3) where N is the number of sources.
-        [
-            [
-                [right_x,  right_y,    right_z],
-                [up_x,     up_y,       up_z],
-                [fwd_x,    fwd_y,      fwd_z]
-            ],
-            [...], [...]
-        ]
-
-    target_locs : :class:`np.array`
-        These are the (x, y, z) coordinates of the targets the angles are calculated for - this array must be
-        supplied as shape(M,3) where M is the number of targets.
-
-    Yields
-    ------
-    :class:`Tuple(np.ndarray, np.ndarray)`
-        A returns a tuple of two np.ndarrays. The first array returns the azimuths of targets relative to the sources,
-        the second tuple returns the elevation of the targets to the sources.
-
-    """
-
-    directions = target_locs - src_locs # in global space
-    # Convert these directions to local coordinate space of the src
-    # @TODO check this logic - 3x3 orientation matrix should be the transformation matrix if each dimension is normalised?
-    directions = np.matvec(src_orientations, directions)
-    azimuth = np.arctan2(directions[:,0], directions[:,2])
-    elevation = np.mod(np.arctan2(directions[:,1], np.hypot(directions[:,0], directions[:,2])), 2 * np.pi)
-
-    return azimuth, elevation
-
 def cart2sph(coordinates):
     x = coordinates[:,0]
     y = coordinates[:,1]
@@ -99,7 +55,7 @@ def squash_sph_harm_array(harm_array):
                 result[i] = np.real(complex_harmonics) * np.sqrt(2)
             elif m < 0:
                 result[i] = np.imag(complex_harmonics) * np.sqrt(2) * float(-1)**(m+1)
-            
+
             result[i] *= float(-1)**(m)
             i+=1
 
@@ -159,7 +115,7 @@ class SphericalHarmonicDirectivity(Directivity):
     Define directivity for all orders of spherical harmonics given a degree.
     """
     n = Int(1)
-    
+
     @cached_property
     def _get_coefficients(self):
         target_directions_local = np.matvec(self.orientation.reshape(-1, 3, 3), self.target_directions.T.reshape(-1, 3))
@@ -224,29 +180,17 @@ class PointSourceDirectional(PointSource):
 
         # additional output channels may be added if we are using sph_harm recievers
         additional_channels = 0
+        # initialising mic_coeffs here in the case we are not using MicGeomDirectional
+        mic_coeffs = np.ones(self.mics.num_mics)
 
-        # -----------------------------------------------------------------------------------------
-        # For now lets do speherical harmonic stuff in here and we will move it
-        # later to somewhere more sensible.
-        # We need to:
-        # - Work out angle of the source from the mics (also the inverse for directional sources
-        #   but for now will assume omnidirectional source)
-        # - calculate spherical harmonics for the modes (need to specify number of order somewhere
-        #   with 1st until we clean and move this)
-        # - based on source direction work out the attenuation for each mode and output to a channel
-        #
-        # Later on:
-        # - clean up - move this somewhere else work out tidy way to do this
-        # - frequency dependant directionality
-        # -----------------------------------------------------------------------------------------
-
+        # If we are using MicGeomDirectional - we work out the mic directivity coefficients here
+        # If SpehericalHarmonicDirectivity is used we will add additional channels to the output
         if isinstance(self.mics, MicGeomDirectional):
             mic_pos = self.mics.pos
             src_pos = np.array(self.loc)
 
             # if sph_harm is the only directivity all coeffs are generated from that object:
             if self.mics.num_mics == 1 and isinstance(self.mics.directivities[0], SphericalHarmonicDirectivity):
-
                 sph_harm_calc = self.mics.directivities[0]
                 sph_harm_calc.target_directions = (src_pos - mic_pos[0]).reshape(3, 1)
                 # create additional channels based on the spherical harmonics order
@@ -254,7 +198,6 @@ class PointSourceDirectional(PointSource):
                 mic_coeffs = sph_harm_calc.coefficients.squeeze()
             # otherwise each directivity is used for each individual mic coeff
             else:
-                mic_coeffs = np.ones(self.num_mics)
                 # @Note - Is there a way to speed this up to prevent iterating over individual Directivities
                 for m, directivity in enumerate(self.mics.directivities):
                     if isinstance(directivity, SphericalHarmonicDirectivity):
@@ -297,45 +240,45 @@ class RotatingPointSource(PointSourceDirectional):
     # Rotation speed in radians/sec - default is 0
     rot_speed = Float(0.0)
 
-    def _calc_rotation_matrix(self, sample_index):
-        # Calculates the 3D rotation matrix for a specific audio sample assuming the rotation is constant
-        # TODO: ensure this works with large numbers
-        time = sample_index / self.sample_freq
-        rot_angle = self.rot_speed * time
-
-        cos_a = np.cos(rot_angle)
-        sin_a = np.sin(rot_angle)
-
-        # build rotation matrix around the y axis
-        rot_mats = np.array([[cos_a,                np.zeros_like(cos_a),   sin_a],
-                             [np.zeros_like(cos_a), np.ones_like(cos_a),    np.zeros_like(cos_a)],
-                             [-sin_a,               np.zeros_like(cos_a),   cos_a]])
-
-        if rot_mats.ndim == 3:
-            rot_mats = rot_mats.transpose(2, 0, 1)
-
-        return rot_mats
-
     def result(self, num=128):
         self._validate_locations()
 
         # object directions do not change once set
         self.directivity.target_directions = self.mics.pos - np.array(self.loc).reshape(3, 1)
 
+        # additional output channels may be added if we are using sph_harm recievers
+        additional_channels = 0
+        # initialising mic_coeffs here in the case we are not using MicGeomDirectional
+        mic_coeffs = np.ones(self.mics.num_mics)
+
+        # If we are using MicGeomDirectional - we work out the mic directivity coefficients here
+        # If SpehericalHarmonicDirectivity is used we will add additional channels to the output
         if isinstance(self.mics, MicGeomDirectional):
-            # @TODO change from lists and speed up by vectorising and to not iterate over each mic
-            azimuths = np.empty(shape=self.mics.num_mics)
-            elevations = np.empty(shape=self.mics.num_mics)
+            mic_pos = self.mics.pos
+            src_pos = np.array(self.loc)
 
-            mic_pos = self.mics.pos.T
-            src_pos = np.array(self.loc).reshape(1, 3)
-
-            azimuths, elevations = get_angle_to_target(mic_pos, self.mics.orientations, src_pos)
-
+            # if sph_harm is the only directivity all coeffs are generated from that object:
+            if self.mics.num_mics == 1 and isinstance(self.mics.directivities[0], SphericalHarmonicDirectivity):
+                sph_harm_calc = self.mics.directivities[0]
+                sph_harm_calc.target_directions = (src_pos - mic_pos[0]).reshape(3, 1)
+                # create additional channels based on the spherical harmonics order
+                additional_channels = num_channels_for_sph_degree(sph_harm_calc.n) - 1
+                mic_coeffs = sph_harm_calc.coefficients.squeeze()
+            # otherwise each directivity is used for each individual mic coeff
+            else:
+                # @Note - Is there a way to speed this up to prevent iterating over individual Directivities
+                for m, directivity in enumerate(self.mics.directivities):
+                    if isinstance(directivity, SphericalHarmonicDirectivity):
+                        raise RuntimeError(f'SphericalHarmonicDirectivity can currently only be used if it is the only mic in the Geom')
+                    else:
+                        directivity.target_directions = (src_pos - mic_pos[m]).reshape(3, 1)
+                        coeff = directivity.coefficients
+                        assert(len(coeff) == 1)
+                        mic_coeffs[m] = coeff
 
         # generate output
         signal = self.signal.usignal(self.up)
-        out = np.empty((num, self.num_channels))
+        out = np.empty((num, self.num_channels + additional_channels))
         # distances
         rm = self.env._r(np.array(self.loc).reshape((3, 1)), self.mics.pos).reshape(1, -1)
         ind = (-rm / self.env.c - self.start_t + self.start) * self.sample_freq
@@ -354,24 +297,23 @@ class RotatingPointSource(PointSourceDirectional):
             n -= 1
             try:
                 self.directivity.orientation = rotation_matrix @ self.directivity.orientation
-                out[i] = signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * self.directivity.coefficients / rm
+                out[i] = (signal[np.array(0.5 + ind * self.up, dtype=np.int64)] * self.directivity.coefficients / rm) * mic_coeffs
                 ind += 1.0
                 i += 1
                 if i == num:
                     yield out
-                    out = np.zeros((num, self.num_channels))
+                    out = np.zeros((num, self.num_channels + additional_channels))
                     i = 0
             except IndexError:
                 break
         yield out[:i]
 
 
+# @TODO none of the XML parsing mechanics has been implemented
 class MicGeomDirectional(MicGeom):
     """
     Extension of MicGeom where directivity can be specified for each microphone
     """
-
-    # @TODO none of the XML parsing mechanics has been implemented
 
     #: Array containing directivity for each microphone, including invalid ones
     directivities_total = List(Instance(Directivity, ()), desc='directivity for each microphone')
